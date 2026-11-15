@@ -34,6 +34,9 @@ go build -o orbit ./cmd/orbit
 
 ## Usage
 
+Export a spreadsheet-friendly record list with `orbit --csv example.com`. CSV output uses one row per record and preserves commas and quotes through standard CSV escaping.
+
+
 ```bash
 ./orbit example.com
 ```
