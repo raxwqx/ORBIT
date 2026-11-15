@@ -34,7 +34,7 @@ go build -o orbit ./cmd/orbit
 
 ## Usage
 
-Export a spreadsheet-friendly record list with `orbit --csv example.com`. CSV output uses one row per record and preserves commas and quotes through standard CSV escaping.
+Export a spreadsheet-friendly record list with `orbit --csv example.com`. CSV output uses one row per DNS, security, PTR, or warning value; commas and quotes are escaped using Go's standard CSV writer, and formula-like cells are neutralized before export. Use `--json` or `--csv`, but not both.
 
 
 ```bash

@@ -36,3 +36,9 @@ func TestParseArgsRejectsDuplicateTarget(t *testing.T) {
 		t.Fatal("expected duplicate target error")
 	}
 }
+
+func TestParseArgsRejectsConflictingFormats(t *testing.T) {
+	if _, err := parseArgs([]string{"example.com", "--json", "--csv"}); err == nil {
+		t.Fatal("expected conflicting output formats to be rejected")
+	}
+}

@@ -65,7 +65,7 @@ func writeCSVRecord(writer *csv.Writer, target, recordType, value string) error 
 }
 
 func safeCSVCell(value string) string {
-	trimmed := strings.TrimLeft(value, " \t\r\n")
+	trimmed := strings.TrimLeftFunc(value, func(r rune) bool { return r <= 0x20 })
 	if len(trimmed) > 0 && strings.ContainsRune("=+-@", rune(trimmed[0])) {
 		return "'" + value
 	}
