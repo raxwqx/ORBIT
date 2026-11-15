@@ -11,11 +11,12 @@ import (
 	"github.com/raxwqx/orbit/internal/output"
 )
 
-const version = "0.1.1"
+const version = "5.0.0"
 
 type options struct {
 	target      string
 	jsonOutput  bool
+	csvOutput   bool
 	timeoutSecs int
 }
 
@@ -42,6 +43,13 @@ func main() {
 		}
 		return
 	}
+	if opts.csvOutput {
+		if err := output.PrintCSV(os.Stdout, result); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	output.PrintTerminal(os.Stdout, result)
 }
@@ -52,6 +60,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "Options:")
 	fmt.Fprintln(os.Stderr, "  -target <domain>   Target domain")
 	fmt.Fprintln(os.Stderr, "  --json             Output results as JSON")
+	fmt.Fprintln(os.Stderr, "  --csv              Output DNS records as CSV")
 	fmt.Fprintln(os.Stderr, "  --timeout <sec>    DNS and DoH timeout in seconds (default: 5)")
 	fmt.Fprintln(os.Stderr, "  --version          Show version")
 	fmt.Fprintln(os.Stderr, "  -h, --help         Show help")
@@ -65,6 +74,7 @@ func parseArgs(args []string) (options, error) {
 
 	flagTarget := fs.String("target", "", "Target domain")
 	flagJSON := fs.Bool("json", false, "Output results as JSON")
+	flagCSV := fs.Bool("csv", false, "Output DNS records as CSV")
 	flagTimeout := fs.Int("timeout", 5, "DNS and DoH timeout in seconds")
 
 	// Help/version are handled here so flags can appear before or after the
@@ -125,7 +135,11 @@ func parseArgs(args []string) (options, error) {
 		return options{}, fmt.Errorf("--timeout must be greater than 0")
 	}
 
+	if *flagJSON && *flagCSV {
+		return options{}, fmt.Errorf("--json and --csv cannot be used together")
+	}
 	opts.jsonOutput = *flagJSON
+	opts.csvOutput = *flagCSV
 	opts.timeoutSecs = *flagTimeout
 	opts.target = strings.TrimSuffix(opts.target, ".")
 	if opts.target == "" {
