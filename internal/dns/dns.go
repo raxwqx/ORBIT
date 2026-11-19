@@ -3,19 +3,37 @@ package dns
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 )
+
+const (
+	defaultDoHEndpoint = "https://cloudflare-dns.com/dns-query"
+	maxPTRLookups      = 64
+	ptrWorkers         = 8
+	maxDoHBodyBytes    = 1 << 20
+
+	typeDNSKEY = 48
+	typeSOA    = 6
+	typeCAA    = 257
+)
+
+var errNXDomain = errors.New("DNS name does not exist")
 
 type Resolver struct {
 	Resolver *net.Resolver
 	Timeout  time.Duration
 	HTTP     *http.Client
+	DoH      string
 }
 
 type SecurityResult struct {
@@ -55,6 +73,7 @@ type LookupResult struct {
 	MX        []string            `json:"MX"`
 	NS        []string            `json:"NS"`
 	TXT       []string            `json:"TXT"`
+	CAA       []string            `json:"CAA"`
 	CNAME     []string            `json:"CNAME"`
 	PTR       map[string][]string `json:"PTR,omitempty"`
 	Security  SecurityResult      `json:"security"`
@@ -66,16 +85,30 @@ func New(timeout time.Duration) *Resolver {
 		Resolver: net.DefaultResolver,
 		Timeout:  timeout,
 		HTTP:     &http.Client{Timeout: timeout},
+		DoH:      defaultDoHEndpoint,
 	}
 }
 
 func (r *Resolver) context() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), r.Timeout)
+	timeout := r.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 func (r *Resolver) Lookup(target string) LookupResult {
 	start := time.Now()
-	result := LookupResult{Target: target}
+	result := LookupResult{
+		Target: target,
+		A:      []string{},
+		AAAA:   []string{},
+		MX:     []string{},
+		NS:     []string{},
+		TXT:    []string{},
+		CAA:    []string{},
+		CNAME:  []string{},
+	}
 
 	type lookupOutput struct {
 		name string
@@ -121,7 +154,7 @@ func (r *Resolver) Lookup(target string) LookupResult {
 				}
 			}
 		case "cname":
-			if cname := strings.TrimSuffix(out.data.(string), "."); cname != "" && cname != target {
+			if cname := strings.TrimSuffix(out.data.(string), "."); cname != "" && !strings.EqualFold(cname, target) {
 				result.CNAME = appendUnique(result.CNAME, cname)
 			}
 		case "mx":
@@ -143,33 +176,18 @@ func (r *Resolver) Lookup(target string) LookupResult {
 	}
 
 	ips := append(append([]string{}, result.A...), result.AAAA...)
-	ptrResults := make(chan ptrOutput, len(ips))
-	for _, ip := range ips {
-		go func(ip string) {
-			ctx, cancel := r.context()
-			defer cancel()
-			names, err := r.Resolver.LookupAddr(ctx, ip)
-			ptrResults <- ptrOutput{ip: ip, names: names, err: err}
-		}(ip)
+	if len(ips) > maxPTRLookups {
+		result.Warnings = append(result.Warnings, fmt.Sprintf(
+			"PTR lookups limited to the first %d of %d addresses", maxPTRLookups, len(ips)))
+		ips = ips[:maxPTRLookups]
 	}
 
-	result.PTR = map[string][]string{}
-	for range ips {
-		out := <-ptrResults
-		if out.err != nil {
-			result.Warnings = append(result.Warnings, "PTR lookup for "+out.ip+": "+out.err.Error())
-			continue
-		}
-		for _, name := range out.names {
-			result.PTR[out.ip] = appendUnique(result.PTR[out.ip], strings.TrimSuffix(name, "."))
-		}
-		sort.Strings(result.PTR[out.ip])
-	}
-	if len(result.PTR) == 0 {
-		result.PTR = nil
-	}
+	ptrs, ptrWarnings := r.lookupPTRs(ips)
+	result.PTR = ptrs
+	result.Warnings = append(result.Warnings, ptrWarnings...)
 
-	result.Security.SPF = inspectSPF(target, result.TXT)
+	result.CAA = r.inspectCAA(target, &result)
+	result.Security.SPF = inspectSPF(result.TXT)
 	result.Security.DMARC = inspectDMARC(r, target, &result)
 	result.Security.DNSSEC = inspectDNSSEC(r, target, &result)
 	result.Security.Summary = buildSummary(result.Security)
@@ -189,13 +207,111 @@ func (r *Resolver) Lookup(target string) LookupResult {
 	return result
 }
 
-type ptrOutput struct {
+type ptrResult struct {
 	ip    string
 	names []string
 	err   error
 }
 
-func inspectSPF(target string, txt []string) SPFResult {
+// lookupPTRs resolves reverse DNS names with a bounded worker pool so a domain
+// with many addresses cannot spawn an unbounded number of goroutines.
+func (r *Resolver) lookupPTRs(ips []string) (map[string][]string, []string) {
+	if len(ips) == 0 {
+		return nil, nil
+	}
+
+	workers := ptrWorkers
+	if len(ips) < workers {
+		workers = len(ips)
+	}
+
+	jobs := make(chan string)
+	results := make(chan ptrResult, len(ips))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range jobs {
+				ctx, cancel := r.context()
+				names, err := r.Resolver.LookupAddr(ctx, ip)
+				cancel()
+				results <- ptrResult{ip: ip, names: names, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		for _, ip := range ips {
+			jobs <- ip
+		}
+		close(jobs)
+	}()
+
+	wg.Wait()
+	close(results)
+
+	ptrs := map[string][]string{}
+	var warnings []string
+	for out := range results {
+		if out.err != nil {
+			warnings = append(warnings, "PTR lookup for "+out.ip+": "+out.err.Error())
+			continue
+		}
+		for _, name := range out.names {
+			ptrs[out.ip] = appendUnique(ptrs[out.ip], strings.TrimSuffix(name, "."))
+		}
+		sort.Strings(ptrs[out.ip])
+	}
+	if len(ptrs) == 0 {
+		return nil, warnings
+	}
+	return ptrs, warnings
+}
+
+// ValidateTarget checks that a target is a plausible hostname before it is used
+// for DNS lookups or printed to a terminal.
+func ValidateTarget(target string) error {
+	if target == "" {
+		return errors.New("target domain is required")
+	}
+	if strings.HasSuffix(target, "..") {
+		return errors.New("target domain must not contain repeated trailing dots")
+	}
+	name := strings.ToLower(strings.TrimSuffix(target, "."))
+	if name == "" {
+		return errors.New("target domain is required")
+	}
+	if len(name) > 253 {
+		return errors.New("target domain must be 253 characters or fewer")
+	}
+
+	for _, label := range strings.Split(name, ".") {
+		if label == "" {
+			return errors.New("target domain contains an empty label")
+		}
+		if len(label) > 63 {
+			return errors.New("target domain contains a label longer than 63 characters")
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("target domain label %q must not start or end with a hyphen", label)
+		}
+		for _, ch := range label {
+			switch {
+			case ch >= 'a' && ch <= 'z':
+			case ch >= '0' && ch <= '9':
+			case ch == '-' || ch == '_':
+			case unicode.IsControl(ch), unicode.IsSpace(ch):
+				return fmt.Errorf("target domain contains whitespace or control characters")
+			default:
+				return fmt.Errorf("target domain contains invalid character %q; use an ASCII or punycode name", ch)
+			}
+		}
+	}
+	return nil
+}
+
+func inspectSPF(txt []string) SPFResult {
 	var result SPFResult
 	for _, record := range txt {
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(record)), "v=spf1") {
@@ -227,48 +343,195 @@ func inspectDMARC(r *Resolver, target string, result *LookupResult) DMARCResult 
 	return out
 }
 
-func inspectDNSSEC(r *Resolver, target string, result *LookupResult) DNSSECResult {
-	const endpoint = "https://cloudflare-dns.com/dns-query"
+// inspectCAA fetches Certificate Authority Authorization records through the
+// same DoH resolver used for DNSSEC checks. CAA lives outside net.Resolver's
+// standard lookup helpers, so DoH is the dependency-free way to read it.
+func (r *Resolver) inspectCAA(target string, result *LookupResult) []string {
+	ctx, cancel := r.context()
+	defer cancel()
 
-	dnskey, err := dohQuery(r, endpoint, target, "DNSKEY")
+	resp, err := r.dohQuery(ctx, target, "CAA")
 	if err != nil {
-		result.Warnings = append(result.Warnings, "DNSSEC DNSKEY check: "+err.Error())
-		return DNSSECResult{Status: "unknown", CheckedVia: "Cloudflare DoH"}
-	}
-
-	status := "unsigned"
-	if dnskey.hasAnswerType(48) {
-		status = "signed"
-	}
-
-	authenticated := false
-	if status == "signed" {
-		a, aErr := dohQuery(r, endpoint, target, "A")
-		if aErr != nil {
-			result.Warnings = append(result.Warnings, "DNSSEC validation check: "+aErr.Error())
-		} else {
-			authenticated = a.AD
+		if !errors.Is(err, errNXDomain) {
+			result.Warnings = append(result.Warnings, "CAA lookup: "+err.Error())
 		}
+		return []string{}
+	}
+
+	records := []string{}
+	for _, answer := range resp.Answer {
+		if answer.Type != typeCAA {
+			continue
+		}
+		if data := strings.TrimSpace(answer.Data); data != "" {
+			records = appendUnique(records, data)
+		}
+	}
+	sort.Strings(records)
+	return records
+}
+
+func inspectDNSSEC(r *Resolver, target string, result *LookupResult) DNSSECResult {
+	const checkedVia = "Cloudflare DoH"
+
+	ctx, cancel := r.context()
+	defer cancel()
+
+	found, successes, dnsErrs := r.findDNSKEY(ctx, target)
+	for _, errText := range dnsErrs {
+		result.Warnings = append(result.Warnings, "DNSSEC DNSKEY check: "+errText)
+	}
+
+	status := "unknown"
+	switch {
+	case found:
+		status = "signed"
+	case successes > 0 && len(dnsErrs) == 0:
+		status = "unsigned"
+	}
+
+	validated := false
+	if status == "signed" {
+		validated = r.dnssecValidated(ctx, target, result)
 	}
 
 	return DNSSECResult{
 		Status:     status,
-		Validated:  authenticated,
-		CheckedVia: "Cloudflare DoH",
+		Validated:  validated,
+		CheckedVia: checkedVia,
 	}
 }
 
+// findDNSKEY looks for a DNSKEY RRset at the target and at its signing zone.
+// DNSKEY records live at the zone apex, so a subdomain query alone would
+// incorrectly report signed zones as unsigned.
+func (r *Resolver) findDNSKEY(ctx context.Context, target string) (bool, int, []string) {
+	tried := map[string]bool{}
+	successes := 0
+	var dnsErrs []string
+	var last dohResponse
+
+	target = strings.ToLower(strings.TrimSuffix(target, "."))
+	tried[target] = true
+
+	resp, err := r.dohQuery(ctx, target, "DNSKEY")
+	switch {
+	case err == nil:
+		successes++
+		last = resp
+		if resp.hasAnswerType(typeDNSKEY) {
+			return true, successes, dnsErrs
+		}
+	case errors.Is(err, errNXDomain):
+		// A nonexistent target has no signing zone to inspect.
+		return false, successes + 1, dnsErrs
+	default:
+		dnsErrs = append(dnsErrs, target+": "+err.Error())
+	}
+
+	try := func(name string) bool {
+		name = strings.ToLower(strings.TrimSuffix(name, "."))
+		if name == "" || tried[name] {
+			return false
+		}
+		tried[name] = true
+
+		resp, err := r.dohQuery(ctx, name, "DNSKEY")
+		if err != nil {
+			if errors.Is(err, errNXDomain) {
+				successes++
+				return false
+			}
+			dnsErrs = append(dnsErrs, name+": "+err.Error())
+			return false
+		}
+		successes++
+		return resp.hasAnswerType(typeDNSKEY)
+	}
+
+	// The SOA in the authority section usually names the actual zone apex.
+	for _, answer := range last.Authority {
+		if answer.Type != typeSOA || !isSubdomainOf(target, answer.Name) {
+			continue
+		}
+		if try(answer.Name) {
+			return true, successes, dnsErrs
+		}
+	}
+
+	// Fall back to walking parent labels, skipping the TLD and, for ccTLDs,
+	// the public-suffix-like second level (for example co.uk).
+	labels := strings.Split(target, ".")
+	for i := 1; i < len(labels); i++ {
+		suffix := labels[i:]
+		if len(suffix) == 1 {
+			break
+		}
+		if len(suffix) == 2 && len(labels[len(labels)-1]) == 2 {
+			break
+		}
+		if try(strings.Join(suffix, ".")) {
+			return true, successes, dnsErrs
+		}
+	}
+
+	return false, successes, dnsErrs
+}
+
+func (r *Resolver) dnssecValidated(ctx context.Context, target string, result *LookupResult) bool {
+	validated := false
+	answered := false
+	var dnsErrs []string
+
+	for _, recordType := range []string{"A", "AAAA"} {
+		resp, err := r.dohQuery(ctx, target, recordType)
+		if err != nil {
+			if errors.Is(err, errNXDomain) {
+				answered = true
+				continue
+			}
+			dnsErrs = append(dnsErrs, recordType+": "+err.Error())
+			continue
+		}
+		answered = true
+		if resp.AD {
+			validated = true
+		}
+	}
+
+	if !answered && len(dnsErrs) > 0 {
+		result.Warnings = append(result.Warnings, "DNSSEC validation check: "+strings.Join(dnsErrs, "; "))
+	}
+	return validated
+}
+
+func isSubdomainOf(name, zone string) bool {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	zone = strings.ToLower(strings.TrimSuffix(zone, "."))
+	if name == "" || zone == "" {
+		return false
+	}
+	return name == zone || strings.HasSuffix(name, "."+zone)
+}
+
 type dohAnswer struct {
-	Type int `json:"type"`
+	Name string `json:"name"`
+	Type int    `json:"type"`
+	Data string `json:"data"`
 }
 
 type dohResponse struct {
-	Status int         `json:"Status"`
-	AD     bool        `json:"AD"`
-	Answer []dohAnswer `json:"Answer"`
+	Status    int         `json:"Status"`
+	AD        bool        `json:"AD"`
+	Answer    []dohAnswer `json:"Answer"`
+	Authority []dohAnswer `json:"Authority"`
 }
 
-func (r *Resolver) dohURL(endpoint, name, recordType string) string {
+func (r *Resolver) dohURL(name, recordType string) string {
+	endpoint := r.DoH
+	if endpoint == "" {
+		endpoint = defaultDoHEndpoint
+	}
 	values := url.Values{}
 	values.Set("name", name)
 	values.Set("type", recordType)
@@ -276,15 +539,13 @@ func (r *Resolver) dohURL(endpoint, name, recordType string) string {
 	return endpoint + "?" + values.Encode()
 }
 
-func dohQuery(r *Resolver, endpoint, name, recordType string) (dohResponse, error) {
-	ctx, cancel := r.context()
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.dohURL(endpoint, name, recordType), nil)
+func (r *Resolver) dohQuery(ctx context.Context, name, recordType string) (dohResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.dohURL(name, recordType), nil)
 	if err != nil {
 		return dohResponse{}, err
 	}
 	req.Header.Set("Accept", "application/dns-json")
+
 	resp, err := r.HTTP.Do(req)
 	if err != nil {
 		return dohResponse{}, err
@@ -296,13 +557,18 @@ func dohQuery(r *Resolver, endpoint, name, recordType string) (dohResponse, erro
 	}
 
 	var out dohResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxDoHBodyBytes)).Decode(&out); err != nil {
 		return dohResponse{}, err
 	}
-	if out.Status == 3 {
-		return out, fmt.Errorf("DNS name does not exist")
+
+	switch out.Status {
+	case 0:
+		return out, nil
+	case 3:
+		return out, errNXDomain
+	default:
+		return out, fmt.Errorf("DoH returned DNS status %d", out.Status)
 	}
-	return out, nil
 }
 
 func (r dohResponse) hasAnswerType(recordType int) bool {
